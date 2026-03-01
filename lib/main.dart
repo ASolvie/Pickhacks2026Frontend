@@ -51,12 +51,72 @@ class MapSampleState extends State<MapSample> {
   bool _loading = true;
   String? _loadError;
 
+  // --- custom info window state ---
+  Offset? _infoOffset; // screen position (pixels)
+  LatLng? _selectedPos;
+  String? _selectedUid;
+  String? _selectedTitle;
+  String? _selectedSnippet;
+
+  bool _suppressNextMapTap = false;
+
   @override
   void initState() {
     super.initState();
     _loadMarkers();
   }
 
+  // -----------------------------
+  // Custom info window helpers
+  // -----------------------------
+  Future<void> _showInfo({
+    required String uid,
+    required LatLng pos,
+    required String title,
+    required String snippet,
+  }) async {
+    if (!_controller.isCompleted) return;
+    final map = await _controller.future;
+    final sc = await map.getScreenCoordinate(pos);
+    if (!mounted) return;
+
+    setState(() {
+      _selectedUid = uid;
+      _selectedPos = pos;
+      _selectedTitle = title;
+      _selectedSnippet = snippet;
+      _infoOffset = Offset(sc.x.toDouble(), sc.y.toDouble());
+    });
+  }
+
+  Future<void> _repositionInfo() async {
+    final pos = _selectedPos;
+    if (pos == null) return;
+    if (!_controller.isCompleted) return;
+
+    final map = await _controller.future;
+    final sc = await map.getScreenCoordinate(pos);
+    if (!mounted) return;
+
+    setState(() {
+      _infoOffset = Offset(sc.x.toDouble(), sc.y.toDouble());
+    });
+  }
+
+  void _hideInfo() {
+    if (!mounted) return;
+    setState(() {
+      _infoOffset = null;
+      _selectedPos = null;
+      _selectedUid = null;
+      _selectedTitle = null;
+      _selectedSnippet = null;
+    });
+  }
+
+  // -----------------------------
+  // Marker loading
+  // -----------------------------
   Future<void> _loadMarkers() async {
     setState(() {
       _loading = true;
@@ -66,7 +126,6 @@ class MapSampleState extends State<MapSample> {
     try {
       final uids = await _fetchUids();
 
-      // Fetch detections in parallel
       final results = await Future.wait(
         uids.map((uid) async {
           final det = await _fetchDetections(uid);
@@ -79,8 +138,6 @@ class MapSampleState extends State<MapSample> {
       for (final item in results) {
         final lat = item.det.lat;
         final lon = item.det.lon;
-
-        // Skip if no coords
         if (lat == null || lon == null) continue;
 
         final pos = LatLng(lat, lon);
@@ -94,7 +151,14 @@ class MapSampleState extends State<MapSample> {
           Marker(
             markerId: MarkerId(item.uid),
             position: pos,
-            infoWindow: InfoWindow(title: title, snippet: snippet),
+
+            // ✅ Use custom window instead of built-in infoWindow
+            onTap: () => _showInfo(
+              uid: item.uid,
+              pos: pos,
+              title: title,
+              snippet: snippet,
+            ),
           ),
         );
       }
@@ -106,7 +170,11 @@ class MapSampleState extends State<MapSample> {
         _loading = false;
       });
 
+      // Optional: hide popup if marker set changed
+      _hideInfo();
+
       // Optional: zoom map to fit markers once loaded
+      // await _fitMarkers(markers);
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -124,7 +192,7 @@ class MapSampleState extends State<MapSample> {
     if (resp.statusCode != 200) {
       throw Exception('uids failed: ${resp.statusCode} ${resp.body}');
     }
-    debugPrint(resp.body);
+
     final decoded = jsonDecode(resp.body);
     if (decoded is! List) {
       throw Exception('uids response not a JSON array');
@@ -138,9 +206,7 @@ class MapSampleState extends State<MapSample> {
     final resp = await http.get(uri);
 
     if (resp.statusCode != 200) {
-      throw Exception(
-        'detections/$uid failed: ${resp.statusCode} ${resp.body}',
-      );
+      throw Exception('detections/$uid failed: ${resp.statusCode} ${resp.body}');
     }
 
     final decoded = jsonDecode(resp.body);
@@ -173,7 +239,6 @@ class MapSampleState extends State<MapSample> {
       northeast: LatLng(maxLat, maxLng),
     );
 
-    // On web, newLatLngBounds can throw if called too early; small delay helps.
     await Future.delayed(const Duration(milliseconds: 150));
     await map.animateCamera(CameraUpdate.newLatLngBounds(bounds, 60));
   }
@@ -190,9 +255,99 @@ class MapSampleState extends State<MapSample> {
             onMapCreated: (GoogleMapController controller) {
               if (!_controller.isCompleted) _controller.complete(controller);
             },
+
+            // tap on map hides popup (guarded)
+            onTap: (_) {
+              if (_suppressNextMapTap) {
+                _suppressNextMapTap = false;
+                return;
+              }
+              _hideInfo();
+            },
+
+            // keep popup aligned after movement
+            onCameraIdle: () async {
+              if (_infoOffset != null) {
+                await _repositionInfo();
+              }
+            },
+
             markers: _markers,
           ),
 
+          // -----------------------
+          // Custom info window UI
+          // -----------------------
+          if (_infoOffset != null)
+            Positioned(
+              left: _infoOffset!.dx - 160, // adjust width/anchor
+              top: _infoOffset!.dy - 190,  // above marker
+              child: Listener(
+                behavior: HitTestBehavior.opaque,
+                onPointerDown: (_) {
+                  // prevent tap-through closing popup
+                  _suppressNextMapTap = true;
+                },
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+
+                  // prevent map gestures that start on the popup (web)
+                  onTap: () {},
+                  onDoubleTap: () {},
+                  onDoubleTapDown: (_) {},
+                  onScaleStart: (_) {},
+                  onScaleUpdate: (_) {},
+                  onScaleEnd: (_) {},
+
+                  child: Material(
+                    elevation: 8,
+                    borderRadius: BorderRadius.circular(14),
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 320),
+                      child: Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: Text(
+                                    _selectedTitle ?? '',
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 16,
+                                    ),
+                                  ),
+                                ),
+                                IconButton(
+                                  padding: EdgeInsets.zero,
+                                  constraints: const BoxConstraints(),
+                                  icon: const Icon(Icons.close, size: 18),
+                                  onPressed: _hideInfo,
+                                ),
+                              ],
+                            ),
+                            if ((_selectedSnippet ?? '').isNotEmpty) ...[
+                              const SizedBox(height: 4),
+                              Text(
+                                _selectedSnippet!,
+                                style: const TextStyle(fontSize: 13),
+                              ),
+                            ],
+                            const SizedBox(height: 10),
+                            AudioPlayButton(url: 'http://66.42.127.17:5000/detections/$_selectedUid/audio'),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+
+          // Loading / error UI
           if (_loading)
             const Positioned(
               top: 16,
@@ -246,6 +401,7 @@ class MapSampleState extends State<MapSample> {
     );
   }
 }
+
 
 class Grid extends StatelessWidget {
   const Grid({super.key, required this.elements});
